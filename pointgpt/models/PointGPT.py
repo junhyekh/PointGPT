@@ -5,15 +5,22 @@ import timm
 from timm.models.layers import DropPath, trunc_normal_
 import numpy as np
 from .build import MODELS
-from utils import misc
-from utils.checkpoint import get_missing_parameters_message, get_unexpected_parameters_message
-from utils.logger import *
+from pointgpt.utils import misc
+from pointgpt.utils.checkpoint import get_missing_parameters_message, get_unexpected_parameters_message
+from pointgpt.utils.logger import *
 import random
 from knn_cuda import KNN
-from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
-from models.GPT import GPT_extractor, GPT_generator
+from pytorch3d.ops import knn_points
+
+import logging
+try: 
+    from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
+except ImportError:
+    logging.warn('Skipping chamfer_dist import.')
+    
+from pointgpt.models.GPT import GPT_extractor, GPT_generator
 import math
-from models.z_order import *
+from pointgpt.models.z_order import *
 
 class Encoder_large(nn.Module):  # Embedding module
     def __init__(self, encoder_channel):
@@ -106,23 +113,27 @@ class Group(nn.Module):
             0, batch_size, device=xyz.device) * self.num_group
         sorted_indices_list = []
         sorted_indices_list.append(idx_base)
-        distances_batch = distances_batch.view(batch_size, self.num_group, self.num_group).transpose(
-            1, 2).contiguous().view(batch_size * self.num_group, self.num_group)
+        distances_batch = distances_batch.reshape(batch_size, self.num_group, self.num_group).transpose(
+            1, 2).reshape(batch_size * self.num_group, self.num_group)
+            #.contiguous().view(batch_size * self.num_group, self.num_group)
         distances_batch[idx_base] = float("inf")
         distances_batch = distances_batch.view(
-            batch_size, self.num_group, self.num_group).transpose(1, 2).contiguous()
+            batch_size, self.num_group, self.num_group).transpose(1, 2)
+            #.contiguous()
         for i in range(self.num_group - 1):
-            distances_batch = distances_batch.view(
+            distances_batch = distances_batch.reshape(
                 batch_size * self.num_group, self.num_group)
             distances_to_last_batch = distances_batch[sorted_indices_list[-1]]
             closest_point_idx = torch.argmin(distances_to_last_batch, dim=-1)
             closest_point_idx = closest_point_idx + idx_base
             sorted_indices_list.append(closest_point_idx)
-            distances_batch = distances_batch.view(batch_size, self.num_group, self.num_group).transpose(
-                1, 2).contiguous().view(batch_size * self.num_group, self.num_group)
+            distances_batch = distances_batch.reshape(batch_size, self.num_group, self.num_group).transpose(
+                1, 2).reshape(batch_size * self.num_group, self.num_group)
+                #.contiguous().view(batch_size * self.num_group, self.num_group)
             distances_batch[closest_point_idx] = float("inf")
             distances_batch = distances_batch.view(
-                batch_size, self.num_group, self.num_group).transpose(1, 2).contiguous()
+                batch_size, self.num_group, self.num_group).transpose(1, 2)
+                #.contiguous()
         sorted_indices = torch.stack(sorted_indices_list, dim=-1)
         sorted_indices = sorted_indices.view(-1)
         return sorted_indices
@@ -156,7 +167,10 @@ class Group(nn.Module):
         # fps the centers out
         center = misc.fps(xyz, self.num_group)  # B G 3
         # knn to get the neighborhood
-        _, idx = self.knn(xyz, center)  # B G M
+        # _, idx = self.knn(xyz, center)  # B G M
+        o = knn_points(center, xyz, K=self.group_size,
+            return_sorted=False)
+        idx = o.idx
         assert idx.size(1) == self.num_group
         assert idx.size(2) == self.group_size
         idx_base = torch.arange(
@@ -164,8 +178,9 @@ class Group(nn.Module):
         idx = idx + idx_base
         idx = idx.view(-1)
         neighborhood = xyz.view(batch_size * num_points, -1)[idx, :]
-        neighborhood = neighborhood.view(
-            batch_size, self.num_group, self.group_size, 3).contiguous()
+        neighborhood = neighborhood.reshape(
+            batch_size, self.num_group, self.group_size, 3)
+            #.contiguous()
         # normalize
         neighborhood = neighborhood - center.unsqueeze(2)
 
@@ -175,11 +190,13 @@ class Group(nn.Module):
         neighborhood = neighborhood.view(
             batch_size * self.num_group, self.group_size, 3)[sorted_indices, :, :]
         neighborhood = neighborhood.view(
-            batch_size, self.num_group, self.group_size, 3).contiguous()
+            batch_size, self.num_group, self.group_size, 3)
+            #.contiguous()
         center = center.view(
             batch_size * self.num_group, 3)[sorted_indices, :]
         center = center.view(
-            batch_size, self.num_group, 3).contiguous()
+            batch_size, self.num_group, 3)
+            #.contiguous()
 
         return neighborhood, center
 
@@ -277,6 +294,12 @@ class PositionEmbeddingCoordsSine(nn.Module):
             scale = 1.0
         self.scale = scale * 2 * math.pi
 
+        dim_t = torch.arange(self.num_pos_feats,
+                             dtype=torch.float32)
+        dim_t = self.temperature ** (2 * torch.div(dim_t,
+                                     2, rounding_mode='trunc') / self.num_pos_feats)
+        self.register_buffer('dim_t', dim_t)
+
     def forward(self, xyz: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -287,10 +310,11 @@ class PositionEmbeddingCoordsSine(nn.Module):
         """
         assert xyz.shape[-1] == self.n_dim
 
-        dim_t = torch.arange(self.num_pos_feats,
-                             dtype=torch.float32, device=xyz.device)
-        dim_t = self.temperature ** (2 * torch.div(dim_t,
-                                     2, rounding_mode='trunc') / self.num_pos_feats)
+        # dim_t = torch.arange(self.num_pos_feats,
+        #                      dtype=torch.float32, device=xyz.device)
+        # dim_t = self.temperature ** (2 * torch.div(dim_t,
+        #                              2, rounding_mode='trunc') / self.num_pos_feats)
+        dim_t = self.dim_t
 
         xyz = xyz * self.scale
         pos_divided = xyz.unsqueeze(-1) / dim_t
@@ -316,6 +340,7 @@ class GPT_Transformer(nn.Module):
         self.drop_path_rate = config.transformer_config.drop_path_rate
         self.num_heads = config.transformer_config.num_heads
         self.group_size = config.group_size
+        self.skip_decoder = config.get('skip_decoder', False)
         print_log(f'[args] {config.transformer_config}', logger='Transformer')
 
         self.encoder_dims = config.transformer_config.encoder_dims
@@ -337,14 +362,16 @@ class GPT_Transformer(nn.Module):
             group_size=self.group_size,
             pretrained=True,
         )
-
-        self.generator_blocks = GPT_generator(
-            embed_dim=self.encoder_dims,
-            num_heads=self.num_heads,
-            num_layers=self.decoder_depth,
-            trans_dim=self.trans_dim,
-            group_size=self.group_size
-        )
+        if self.skip_decoder:
+            self.generator_blocks = None
+        else:
+            self.generator_blocks = GPT_generator(
+                embed_dim=self.encoder_dims,
+                num_heads=self.num_heads,
+                num_layers=self.decoder_depth,
+                trans_dim=self.trans_dim,
+                group_size=self.group_size
+            )
 
         # do not perform additional mask on the first (self.keep_attend) tokens
         self.keep_attend = 10
@@ -369,6 +396,24 @@ class GPT_Transformer(nn.Module):
             trunc_normal_(m.weight, std=.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+
+    def extract_feature(self, neighborhood, center):
+        group_input_tokens = self.encoder(neighborhood)  # B G C
+
+        batch_size, seq_len, C = group_input_tokens.size()
+
+        sos_pos = self.sos_pos.expand(group_input_tokens.size(0), -1, -1)
+        pos_absolute = self.pos_embed(center)
+        pos_absolute = torch.cat([sos_pos, pos_absolute], dim=1)
+
+        attn_mask = torch.full(
+            (seq_len+1, seq_len+1), -float("Inf"), device=group_input_tokens.device, dtype=group_input_tokens.dtype
+        ).to(torch.bool)
+        attn_mask = torch.triu(attn_mask, diagonal=1)
+        encoded_features = self.blocks.extract_feature(
+                group_input_tokens, pos_absolute, attn_mask)
+        return encoded_features
+        
 
     def forward(self, neighborhood, center, noaug=False, classify=False):
         # generate mask
@@ -458,7 +503,8 @@ class PointGPT(nn.Module):
 
         self.loss = config.loss
 
-        self.build_loss_func(self.loss)
+        if self.loss is not None:
+            self.build_loss_func(self.loss)
 
     def build_loss_func(self, loss_type):
         if loss_type == "cdl1":
@@ -471,6 +517,36 @@ class PointGPT(nn.Module):
         else:
             raise NotImplementedError
         self.loss_func_c = nn.MSELoss().cuda()
+
+    def load_model_from_ckpt(self, bert_ckpt_path):
+        if bert_ckpt_path is not None:
+            ckpt = torch.load(bert_ckpt_path)
+            base_ckpt = {k.replace("module.", ""): v for k,
+                         v in ckpt['base_model'].items()}
+
+        incompatible = self.load_state_dict(base_ckpt, strict=False)
+
+        if incompatible.missing_keys:
+            print_log('missing_keys', logger='Transformer')
+            print_log(
+                get_missing_parameters_message(incompatible.missing_keys),
+                logger='Transformer'
+            )
+        if incompatible.unexpected_keys:
+            print_log('unexpected_keys', logger='Transformer')
+            print_log(
+                get_unexpected_parameters_message(
+                    incompatible.unexpected_keys),
+                logger='Transformer'
+            )
+
+    def extract_embed(self, pts):
+        with torch.inference_mode():
+            neighborhood, center = self.group_divider(pts)
+
+            return self.GPT_Transformer.extract_feature(
+                neighborhood, center
+            )
 
     def forward(self, pts, vis=False, **kwargs):
         neighborhood, center = self.group_divider(pts)
